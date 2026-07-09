@@ -47,7 +47,7 @@ jobs:
           retention-days: 14
 
   lint-frontend:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -91,7 +91,7 @@ jobs:
   # puis les exporte en .tar afin que trivy-scan les recharge au lieu
   # de les reconstruire (évite un double build backend + frontend).
   build-docker-images:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     needs: [lint-backend, lint-frontend]
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +120,7 @@ jobs:
           retention-days: 1
 
   coverage-report:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     needs: [lint-backend, lint-frontend]
     steps:
       - uses: actions/checkout@v4
@@ -347,7 +347,7 @@ jobs:
           attachments: ${{ env.COVERAGE_PDF_OK == 'true' && 'coverage-report.pdf' || '' }}
 
   trivy-scan:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     needs: [build-docker-images, coverage-report]
     steps:
       - uses: actions/checkout@v4
@@ -607,7 +607,7 @@ jobs:
           attachments: ${{ env.COVERAGE_PDF_AVAILABLE == 'true' && 'backend-report.pdf,frontend-report.pdf,coverage-pdf/coverage-report.pdf' || 'backend-report.pdf,frontend-report.pdf' }}
 
   push-dockerhub:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     needs: trivy-scan
     # On ne pousse une image et on ne déclenche un redéploiement que pour les
     # 3 branches d'environnement. Une PR ou une autre branche s'arrête ici.
@@ -657,7 +657,7 @@ jobs:
   # commit/push ce changement. ArgoCD (Application dédiée à cet environnement,
   # qui watch ce même repo/branche/path) détecte la modification et resynchronise.
   update-k8s-manifests:
-    runs-on: self-hosted
+    runs-on: ubuntu-22.04
     needs: push-dockerhub
     permissions:
       contents: write
