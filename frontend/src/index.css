@@ -1,0 +1,52 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+
+@theme {
+  --font-display: 'Space Grotesk', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --color-ink: #1B2430;
+  --color-ink-soft: #263141;
+  --color-paper: #F7F5F0;
+  --color-card: #FFFFFF;
+  --color-slate: #5B6B79;
+  --color-slate-light: #93A2AE;
+  --color-line: #E4E0D6;
+
+  --color-amber: #E3A008;
+  --color-amber-soft: #FCF1D6;
+  --color-teal: #2F6F62;
+  --color-teal-soft: #E4EFEC;
+  --color-rose: #C1443C;
+  --color-rose-soft: #F7E6E4;
+  --color-indigo: #4B5AA8;
+  --color-indigo-soft: #E9EAF5;
+}
+
+body {
+  background-color: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--color-slate-light); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+:focus-visible {
+  outline: 2px solid var(--color-amber);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

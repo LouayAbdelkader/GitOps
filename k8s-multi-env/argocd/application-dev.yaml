@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: employee-app-dev
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/LouayAbdelkader/GitOps-App.git
+    targetRevision: develop        # ou "main" si tu restes en path-based pur
+    path: k8s-multi-env/k8s/overlays/dev
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: employee-dev
+
+  syncPolicy:
+    automated:
+      prune: true       # supprime les ressources retirées du repo
+      selfHeal: true     # corrige tout écart manuel (drift) automatiquement
+    syncOptions:
+      - CreateNamespace=true

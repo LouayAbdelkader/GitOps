@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: employee-dev
+
+resources:
+  - ../../base
+
+# Les tags sont mis à jour automatiquement par la CI
+# (étape "kustomize edit set image" sur la branche develop).
+# IMPORTANT: "dev-latest" n'a jamais existé sur Docker Hub (le job
+# push-dockerhub ne pousse que ":latest" et ":<short-sha>"), donc ce
+# placeholder provoquait un ImagePullBackOff. On repart sur "latest",
+# qui existe réellement, en attendant que la CI committe le vrai tag.
+images:
+  - name: silou19/backend
+    newTag: latest
+  - name: silou19/frontend
+    newTag: latest
+
+patches:
+  - path: patch-replicas.yaml
+  - path: patch-nodeport.yaml

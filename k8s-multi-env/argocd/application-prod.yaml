@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: employee-app-prod
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/LouayAbdelkader/GitOps-App.git
+    targetRevision: main
+    path: k8s-multi-env/k8s/overlays/prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: employee-prod
+
+  # PAS de bloc "automated" ici : ArgoCD détecte le changement (OutOfSync)
+  # mais attend un clic "Sync" manuel dans l'UI/CLI -> ça sert d'approval workflow.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

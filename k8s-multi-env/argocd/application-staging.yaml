@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: employee-app-staging
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/LouayAbdelkader/GitOps-App.git
+    targetRevision: staging
+    path: k8s-multi-env/k8s/overlays/staging
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: employee-staging
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

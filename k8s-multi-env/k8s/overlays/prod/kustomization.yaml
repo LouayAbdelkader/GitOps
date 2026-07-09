@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: employee-prod
+
+resources:
+- ../../base
+
+# En prod, le tag n'est jamais "latest" flottant : la CI fige un tag
+# figé (SHA court) après validation manuelle / promotion depuis staging.
+images:
+- name: silou19/backend
+  newName: silou19/backend
+  newTag: 3118baf
+- name: silou19/frontend
+  newName: silou19/frontend
+  newTag: 3118baf
+
+patches:
+- path: patch-replicas.yaml
+- path: patch-resources.yaml
+- path: patch-nodeport.yaml
