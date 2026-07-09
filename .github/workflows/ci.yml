@@ -1,0 +1,721 @@
+name: CI - Test de base
+on:
+  push:
+    branches: [main, staging, develop]
+  pull_request:
+    branches: [main, staging, develop]
+jobs:
+  lint-backend:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Installer les dépendances
+        working-directory: backend
+        run: npm ci
+
+      - name: Lint (si un script existe)
+        working-directory: backend
+        run: npm run lint --if-present
+
+      - name: Tests + Coverage Backend
+        working-directory: backend
+        run: npm test
+
+      - name: Afficher le % de couverture (Backend)
+        working-directory: backend
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            PCT=$(jq '.total.lines.pct' coverage/coverage-summary.json)
+            echo "### Couverture Backend : ${PCT}%" >> "$GITHUB_STEP_SUMMARY"
+            jq -r '.total | to_entries[] | "- **\(.key)**: \(.value.pct)%"' coverage/coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Pas de rapport de couverture trouvé (backend)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Uploader le rapport de couverture (Backend)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-backend
+          path: backend/coverage
+          retention-days: 14
+
+  lint-frontend:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Installer les dépendances
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Tests + Coverage Frontend
+        working-directory: frontend
+        run: npm test
+
+      - name: Afficher le % de couverture (Frontend)
+        working-directory: frontend
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            PCT=$(jq '.total.lines.pct' coverage/coverage-summary.json)
+            echo "### Couverture Frontend : ${PCT}%" >> "$GITHUB_STEP_SUMMARY"
+            jq -r '.total | to_entries[] | "- **\(.key)**: \(.value.pct)%"' coverage/coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Pas de rapport de couverture trouvé (frontend)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Uploader le rapport de couverture (Frontend)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-frontend
+          path: frontend/coverage
+          retention-days: 14
+
+  # Ce job construit les images UNE SEULE FOIS pour tout le pipeline,
+  # puis les exporte en .tar afin que trivy-scan les recharge au lieu
+  # de les reconstruire (évite un double build backend + frontend).
+  build-docker-images:
+    runs-on: self-hosted
+    needs: [lint-backend, lint-frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image backend
+        run: docker build -t backend:test ./backend
+
+      - name: Build image frontend
+        run: docker build -t frontend:test ./frontend
+
+      - name: Lister les images construites
+        run: docker images
+
+      - name: Exporter les images en .tar (pour réutilisation par trivy-scan)
+        run: |
+          docker save backend:test -o backend-image.tar
+          docker save frontend:test -o frontend-image.tar
+
+      - name: Uploader les images comme artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: |
+            backend-image.tar
+            frontend-image.tar
+          retention-days: 1
+
+  coverage-report:
+    runs-on: self-hosted
+    needs: [lint-backend, lint-frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Récupérer la couverture Backend
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-backend
+          path: coverage-backend
+        continue-on-error: true
+
+      - name: Récupérer la couverture Frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-frontend
+          path: coverage-frontend
+        continue-on-error: true
+
+      - name: Générer le rapport de couverture (HTML)
+        if: always()
+        run: |
+          REPO="${{ github.repository }}"
+          SHA="${{ github.sha }}"
+          OUT="coverage-report.html"
+
+          pct_class() {
+            awk -v p="$1" 'BEGIN{
+              if (p >= 80) print "good";
+              else if (p >= 50) print "mid";
+              else print "bad";
+            }'
+          }
+
+          bar_color() {
+            case "$1" in
+              good) echo "#16a34a" ;;
+              mid) echo "#d97706" ;;
+              bad) echo "#dc2626" ;;
+            esac
+          }
+
+          render_rows() {
+            jq -r '
+              to_entries
+              | map(select(.key != "total"))
+              | .[]
+              | [.key, .value.lines.pct, .value.statements.pct, .value.functions.pct, .value.branches.pct]
+              | @tsv
+            ' "$1"
+          }
+
+          render_section() {
+            local title="$1" json_file="$2"
+            if [ ! -f "$json_file" ]; then
+              echo "<h2 class=\"target\">${title}</h2>"
+              echo "<p class=\"missing\">Rapport de couverture introuvable pour ${title}.</p>"
+              return
+            fi
+            echo "<h2 class=\"target\">${title}</h2>"
+            echo "<table><tr><th>Fichier</th><th>Lignes</th><th>Instructions</th><th>Fonctions</th><th>Branches</th></tr>"
+            while IFS=$'\t' read -r file lines stmts funcs branches; do
+              short_file="${file#/*/src/}"
+              short_file="src/${short_file}"
+              cls=$(pct_class "$lines")
+              color=$(bar_color "$cls")
+              echo "<tr><td>${short_file}</td><td><span class=\"bar-bg\"><span class=\"bar-fill\" style=\"width:${lines}%;background:${color}\"></span></span><span class=\"${cls}\">${lines}%</span></td><td>${stmts}%</td><td>${funcs}%</td><td>${branches}%</td></tr>"
+            done < <(render_rows "$json_file")
+            echo "</table>"
+          }
+
+          stat_card() {
+            local label="$1" json_file="$2"
+            if [ ! -f "$json_file" ]; then
+              echo "<div class=\"stat-card\"><div class=\"pct bad\">N/A</div><div class=\"label\">${label}</div></div>"
+              return
+            fi
+            local pct cls
+            pct=$(jq '.total.lines.pct' "$json_file")
+            cls=$(pct_class "$pct")
+            echo "<div class=\"stat-card\"><div class=\"pct ${cls}\">${pct}%</div><div class=\"label\">${label} — lignes couvertes</div></div>"
+          }
+
+          {
+          cat <<HTML
+          <!DOCTYPE html>
+          <html lang="fr">
+          <head>
+          <meta charset="UTF-8">
+          <style>
+            :root{--bg:#f8fafc;--card:#ffffff;--line:#e2e8f0;--text:#1e293b;--muted:#64748b;}
+            body{font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);margin:0;padding:32px;color:var(--text);}
+            .header{background:linear-gradient(135deg,#1e293b,#334155);color:#fff;padding:28px 32px;border-radius:12px;margin-bottom:28px;}
+            .header h1{margin:0;font-size:22px;}
+            .header p{margin:6px 0 0;opacity:.85;font-size:13px;}
+            .summary{display:flex;gap:16px;margin-bottom:8px;}
+            .stat-card{flex:1;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px;text-align:center;}
+            .stat-card .pct{font-size:32px;font-weight:700;}
+            .stat-card .label{font-size:12px;color:var(--muted);margin-top:4px;}
+            .good{color:#16a34a}.mid{color:#d97706}.bad{color:#dc2626}
+            h2.target{font-size:16px;border-left:4px solid #2563eb;padding-left:10px;margin:32px 0 12px;}
+            table{width:100%;border-collapse:collapse;background:var(--card);border-radius:10px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.04);}
+            th{background:#f1f5f9;text-align:left;padding:10px 14px;font-size:12px;text-transform:uppercase;color:var(--muted);}
+            td{padding:10px 14px;font-size:13px;border-top:1px solid var(--line);}
+            .bar-bg{background:#e2e8f0;border-radius:4px;height:8px;width:90px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:8px;}
+            .bar-fill{height:8px;border-radius:4px;display:block;}
+            tr:hover td{background:#f8fafc;}
+            .missing{color:var(--muted);font-style:italic;}
+            .footer{margin-top:32px;font-size:11px;color:var(--muted);text-align:center;}
+          </style>
+          </head>
+          <body>
+          <div class="header">
+            <h1>Rapport de couverture de code</h1>
+            <p>${REPO} · commit ${SHA}</p>
+          </div>
+          <div class="summary">
+          HTML
+          stat_card "Backend" "coverage-backend/coverage-summary.json"
+          stat_card "Frontend" "coverage-frontend/coverage-summary.json"
+          echo "</div>"
+          render_section "Backend" "coverage-backend/coverage-summary.json"
+          render_section "Frontend" "coverage-frontend/coverage-summary.json"
+          echo '<div class="footer">Généré automatiquement par la pipeline CI/CD</div></body></html>'
+          } > "$OUT"
+
+      - name: Installer wkhtmltopdf
+        if: always()
+        run: sudo apt-get install -y wkhtmltopdf
+
+      - name: Convertir en PDF
+        if: always()
+        run: wkhtmltopdf --enable-local-file-access coverage-report.html coverage-report.pdf
+
+      - name: Résumer la couverture pour l'email
+        if: always()
+        run: |
+          BACKEND_PCT=$(jq '.total.lines.pct' coverage-backend/coverage-summary.json 2>/dev/null || echo "?")
+          FRONTEND_PCT=$(jq '.total.lines.pct' coverage-frontend/coverage-summary.json 2>/dev/null || echo "?")
+          echo "BACKEND_PCT=$BACKEND_PCT" >> "$GITHUB_ENV"
+          echo "FRONTEND_PCT=$FRONTEND_PCT" >> "$GITHUB_ENV"
+
+      - name: Vérifier la présence du rapport PDF
+        if: always()
+        run: |
+          if [ -s coverage-report.pdf ]; then
+            echo "COVERAGE_PDF_OK=true" >> "$GITHUB_ENV"
+          else
+            echo "COVERAGE_PDF_OK=false" >> "$GITHUB_ENV"
+            echo "Le rapport PDF n'a pas pu être généré, l'email partira sans pièce jointe." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Uploader le rapport de couverture (PDF)
+        if: always() && env.COVERAGE_PDF_OK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-pdf
+          path: coverage-report.pdf
+          retention-days: 14
+
+      - name: Envoyer le rapport de couverture par email
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Rapport de couverture de code — ${{ github.repository }} — ${{ job.status == 'success' && 'Succès' || 'Échec' }}"
+          to: ${{ secrets.EMAIL_TO }}
+          from: GitHub Actions CI
+          convert_markdown: true
+          html_body: |
+            <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 640px; margin: auto; background: #f1f5f9; padding: 24px;">
+              <div style="background: #ffffff; border-radius: 14px; overflow: hidden; border: 1px solid #e2e8f0;">
+                <div style="background: linear-gradient(135deg, #0f172a, #1e293b); padding: 32px 36px;">
+                  <p style="margin: 0; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #94a3b8;">Pipeline CI/CD</p>
+                  <h1 style="margin: 8px 0 0; font-size: 21px; color: #ffffff; font-weight: 600;">Rapport de couverture de code</h1>
+                  <p style="margin: 10px 0 0; font-size: 13px; color: #cbd5e1;">${{ github.repository }} &nbsp;·&nbsp; commit ${{ github.sha }}</p>
+                </div>
+
+                <div style="padding: 32px 36px;">
+                  <table role="presentation" style="width: 100%; border-collapse: collapse; margin-bottom: 24px;">
+                    <tr>
+                      <td style="padding: 8px 0; font-size: 13px; color: #64748b;">Statut du job</td>
+                      <td style="padding: 8px 0; text-align: right;">
+                        <span style="display: inline-block; padding: 4px 14px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: .02em; background: ${{ job.status == 'success' && '#dcfce7' || '#fee2e2' }}; color: ${{ job.status == 'success' && '#166534' || '#991b1b' }};">
+                          ${{ job.status == 'success' && 'SUCCÈS' || 'ÉCHEC' }}
+                        </span>
+                      </td>
+                    </tr>
+                  </table>
+
+                  <table style="width: 100%; border-collapse: collapse; margin-bottom: 24px;">
+                    <tr style="background: #f8fafc;">
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-weight: 600; font-size: 13px; color: #334155;">Projet</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-weight: 600; font-size: 13px; color: #334155;">Couverture (lignes)</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-size: 13px; color: #334155;">Backend</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; color: #2563eb; font-weight: 700; font-size: 13px;">${{ env.BACKEND_PCT }}%</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-size: 13px; color: #334155;">Frontend</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; color: #2563eb; font-weight: 700; font-size: 13px;">${{ env.FRONTEND_PCT }}%</td>
+                    </tr>
+                  </table>
+
+                  <p style="font-size: 13px; color: #64748b; line-height: 1.6; margin: 0 0 20px;">
+                    ${{ env.COVERAGE_PDF_OK == 'true' && 'Le détail fichier par fichier est disponible dans le rapport PDF joint à cet email.' || 'Le rapport PDF détaillé n''a pas pu être généré pour cette exécution ; seul le résumé ci-dessus est disponible.' }}
+                  </p>
+
+                  <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                     style="display: inline-block; padding: 11px 22px; background: #2563eb; color: #ffffff; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600;">
+                    Voir le run GitHub Actions
+                  </a>
+                </div>
+
+                <div style="background: #f8fafc; padding: 16px 36px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8;">
+                  Généré automatiquement par la pipeline CI/CD
+                </div>
+              </div>
+            </div>
+          attachments: ${{ env.COVERAGE_PDF_OK == 'true' && 'coverage-report.pdf' || '' }}
+
+  trivy-scan:
+    runs-on: self-hosted
+    needs: [build-docker-images, coverage-report]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Télécharger les images buildées
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Charger les images Docker
+        run: |
+          docker load -i backend-image.tar
+          docker load -i frontend-image.tar
+          docker images
+
+      - name: Télécharger le rapport de couverture (PDF)
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report-pdf
+          path: coverage-pdf
+        continue-on-error: true
+
+      - name: Installer Trivy
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Installer wkhtmltopdf (conversion HTML -> PDF)
+        run: sudo apt-get install -y wkhtmltopdf
+
+      - name: Créer le template HTML personnalisé du rapport
+        run: |
+          cat > report-template.tpl << 'TPL_EOF'
+          <!DOCTYPE html>
+          <html lang="fr">
+          <head>
+          <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+          {{- if . }}
+          <style>
+            :root{--bg:#f8fafc;--card:#ffffff;--line:#e2e8f0;--text:#1e293b;--muted:#64748b;}
+            *{box-sizing:border-box;}
+            body{font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);margin:0;padding:32px;color:var(--text);}
+            .header{background:linear-gradient(135deg,#1e293b,#334155);color:#fff;padding:28px 32px;border-radius:12px;margin-bottom:28px;}
+            .header h1{margin:0;font-size:22px;}
+            .header p{margin:6px 0 0;opacity:.85;font-size:13px;}
+            h2.target{font-size:16px;border-left:4px solid #2563eb;padding-left:10px;margin:32px 0 12px;word-break:break-all;}
+            .empty{background:#ecfdf5;border:1px solid #a7f3d0;color:#047857;padding:14px 18px;border-radius:10px;font-size:13px;margin-bottom:8px;}
+            table{width:100%;border-collapse:collapse;background:var(--card);border-radius:10px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.04);margin-bottom:8px;}
+            th{background:#f1f5f9;text-align:left;padding:10px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);white-space:nowrap;}
+            td{padding:10px 12px;font-size:13px;border-top:1px solid var(--line);vertical-align:top;}
+            tr:hover td{background:#f8fafc;}
+            .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;color:#fff;letter-spacing:.02em;}
+            .pill-CRITICAL{background:#dc2626;}
+            .pill-HIGH{background:#ea580c;}
+            .pill-MEDIUM{background:#d97706;}
+            .pill-LOW{background:#16a34a;}
+            .pill-UNKNOWN{background:#64748b;}
+            .row-CRITICAL{border-left:3px solid #dc2626;}
+            .row-HIGH{border-left:3px solid #ea580c;}
+            td.pkg{font-weight:600;}
+            td.links a{display:inline-block;margin-right:8px;font-size:12px;color:#2563eb;text-decoration:none;}
+            td.links a:hover{text-decoration:underline;}
+            .footer{margin-top:32px;font-size:11px;color:var(--muted);text-align:center;}
+          </style>
+          <title>{{- escapeXML ( index . 0 ).Target }} - Rapport Trivy</title>
+          {{- end }}
+          </head>
+          <body>
+          {{- if . }}
+          <div class="header">
+            <h1>Rapport de vulnérabilités</h1>
+            <p>{{- escapeXML ( index . 0 ).Target }} · généré le {{ now }}</p>
+          </div>
+          {{- range . }}
+          <h2 class="target">{{ escapeXML .Target }} <span style="font-weight:400;color:#94a3b8;">({{ .Type | toString | escapeXML }})</span></h2>
+            {{- if (eq (len .Vulnerabilities) 0) }}
+          <div class="empty">Aucune vulnérabilité trouvée pour cette cible.</div>
+            {{- else }}
+          <table>
+            <tr>
+              <th>Paquet</th>
+              <th>CVE</th>
+              <th>Sévérité</th>
+              <th>Version installée</th>
+              <th>Version corrigée</th>
+              <th>Titre</th>
+              <th>Références</th>
+            </tr>
+            {{- range .Vulnerabilities }}
+            <tr class="row-{{ escapeXML .Vulnerability.Severity }}">
+              <td class="pkg">{{ escapeXML .PkgName }}</td>
+              <td>{{ escapeXML .VulnerabilityID }}</td>
+              <td><span class="pill pill-{{ escapeXML .Vulnerability.Severity }}">{{ escapeXML .Vulnerability.Severity }}</span></td>
+              <td>{{ escapeXML .InstalledVersion }}</td>
+              <td>{{ if .FixedVersion }}{{ escapeXML .FixedVersion }}{{ else }}—{{ end }}</td>
+              <td style="max-width:280px;white-space:normal;">{{ escapeXML .Vulnerability.Title }}</td>
+              <td class="links" data-more-links="off">
+                {{- $refs := .Vulnerability.References }}
+                {{- range $i, $r := $refs }}
+                  {{- if lt $i 3 }}
+                <a href={{ escapeXML $r | printf "%q" }} target="_blank" rel="noopener">lien {{ add1 $i }}</a>
+                  {{- end }}
+                {{- end }}
+                {{- if gt (len $refs) 3 }}
+                <span style="color:#94a3b8;font-size:11px;">+{{ sub (len $refs) 3 }}</span>
+                {{- end }}
+              </td>
+            </tr>
+            {{- end }}
+          </table>
+            {{- end }}
+          {{- end }}
+          <div class="footer">Généré automatiquement par la pipeline CI/CD · Trivy</div>
+          {{- else }}
+          <div class="header"><h1>Rapport Trivy vide</h1></div>
+          {{- end }}
+          </body>
+          </html>
+          TPL_EOF
+
+      - name: Scan backend - CRITICAL et HIGH (JSON)
+        run: trivy image --severity CRITICAL,HIGH --exit-code 0 --format json --output backend-report.json backend:test
+
+      - name: Scan frontend - CRITICAL et HIGH (JSON)
+        run: trivy image --severity CRITICAL,HIGH --exit-code 0 --format json --output frontend-report.json frontend:test
+
+      - name: Générer les rapports HTML puis PDF
+        if: always()
+        run: |
+          for app in backend frontend; do
+            if [ -f "${app}-report.json" ]; then
+              trivy convert --format template --template "@report-template.tpl" -o "${app}-report.html" "${app}-report.json"
+              wkhtmltopdf --enable-local-file-access "${app}-report.html" "${app}-report.pdf"
+            fi
+          done
+
+      - name: Uploader les rapports comme artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports-critical-high
+          path: |
+            backend-report.pdf
+            frontend-report.pdf
+          retention-days: 14
+
+      - name: Préparer le résumé pour l'email
+        if: always()
+        run: |
+          BACKEND_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' backend-report.json 2>/dev/null || echo "?")
+          BACKEND_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' backend-report.json 2>/dev/null || echo "?")
+          FRONTEND_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' frontend-report.json 2>/dev/null || echo "?")
+          FRONTEND_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' frontend-report.json 2>/dev/null || echo "?")
+          echo "BACKEND_CRITICAL=$BACKEND_CRITICAL" >> "$GITHUB_ENV"
+          echo "BACKEND_HIGH=$BACKEND_HIGH" >> "$GITHUB_ENV"
+          echo "FRONTEND_CRITICAL=$FRONTEND_CRITICAL" >> "$GITHUB_ENV"
+          echo "FRONTEND_HIGH=$FRONTEND_HIGH" >> "$GITHUB_ENV"
+
+      - name: Vérifier la présence du rapport de couverture
+        if: always()
+        run: |
+          if [ -s coverage-pdf/coverage-report.pdf ]; then
+            echo "COVERAGE_PDF_AVAILABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "COVERAGE_PDF_AVAILABLE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Faire échouer le pipeline si des vulnérabilités ont été trouvées
+        if: always()
+        run: |
+          num() { [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo 0; }
+          BC=$(num "$BACKEND_CRITICAL"); BH=$(num "$BACKEND_HIGH")
+          FC=$(num "$FRONTEND_CRITICAL"); FH=$(num "$FRONTEND_HIGH")
+          TOTAL=$((BC + BH + FC + FH))
+
+          echo "### Résultat du scan Trivy" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Backend : ${BC} critique(s), ${BH} high" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Frontend : ${FC} critique(s), ${FH} high" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "$TOTAL vulnérabilité(s) CRITICAL/HIGH détectée(s) au total. Les deux images ont bien été scannées et les rapports envoyés, mais le pipeline échoue désormais volontairement."
+            exit 1
+          fi
+          echo "Aucune vulnérabilité CRITICAL/HIGH détectée."
+
+      - name: Envoyer les rapports par email (design HTML)
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Rapport de scan Trivy — ${{ github.repository }} — ${{ job.status == 'success' && 'Succès' || 'Échec' }}"
+          to: ${{ secrets.EMAIL_TO }}
+          from: GitHub Actions Security
+          convert_markdown: true
+          html_body: |
+            <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 640px; margin: auto; background: #f1f5f9; padding: 24px;">
+              <div style="background: #ffffff; border-radius: 14px; overflow: hidden; border: 1px solid #e2e8f0;">
+                <div style="background: linear-gradient(135deg, #0f172a, #1e293b); padding: 32px 36px;">
+                  <p style="margin: 0; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #94a3b8;">Pipeline CI/CD · Sécurité</p>
+                  <h1 style="margin: 8px 0 0; font-size: 21px; color: #ffffff; font-weight: 600;">Rapport de scan Trivy</h1>
+                  <p style="margin: 10px 0 0; font-size: 13px; color: #cbd5e1;">${{ github.repository }} &nbsp;·&nbsp; commit ${{ github.sha }}</p>
+                </div>
+
+                <div style="padding: 32px 36px;">
+                  <table role="presentation" style="width: 100%; border-collapse: collapse; margin-bottom: 24px;">
+                    <tr>
+                      <td style="padding: 8px 0; font-size: 13px; color: #64748b;">Statut du job</td>
+                      <td style="padding: 8px 0; text-align: right;">
+                        <span style="display: inline-block; padding: 4px 14px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: .02em; background: ${{ job.status == 'success' && '#dcfce7' || '#fee2e2' }}; color: ${{ job.status == 'success' && '#166534' || '#991b1b' }};">
+                          ${{ job.status == 'success' && 'SUCCÈS' || 'ÉCHEC' }}
+                        </span>
+                      </td>
+                    </tr>
+                  </table>
+
+                  <table style="width: 100%; border-collapse: collapse; margin-bottom: 24px;">
+                    <tr style="background: #f8fafc;">
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-weight: 600; font-size: 13px; color: #334155;">Image</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-weight: 600; font-size: 13px; color: #334155; text-align: center;">Critiques</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-weight: 600; font-size: 13px; color: #334155; text-align: center;">High</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-size: 13px; color: #334155;">backend:test</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; text-align: center; color: ${{ env.BACKEND_CRITICAL == '0' && '#16a34a' || '#dc2626' }}; font-weight: 700; font-size: 13px;">${{ env.BACKEND_CRITICAL }}</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; text-align: center; color: ${{ env.BACKEND_HIGH == '0' && '#16a34a' || '#ea580c' }}; font-weight: 700; font-size: 13px;">${{ env.BACKEND_HIGH }}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; font-size: 13px; color: #334155;">frontend:test</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; text-align: center; color: ${{ env.FRONTEND_CRITICAL == '0' && '#16a34a' || '#dc2626' }}; font-weight: 700; font-size: 13px;">${{ env.FRONTEND_CRITICAL }}</td>
+                      <td style="padding: 12px 14px; border: 1px solid #e2e8f0; text-align: center; color: ${{ env.FRONTEND_HIGH == '0' && '#16a34a' || '#ea580c' }}; font-weight: 700; font-size: 13px;">${{ env.FRONTEND_HIGH }}</td>
+                    </tr>
+                  </table>
+
+                  <p style="font-size: 13px; color: #64748b; line-height: 1.6; margin: 0 0 20px;">
+                    Les rapports détaillés (un PDF par image) sont joints à cet email.
+                    ${{ env.COVERAGE_PDF_AVAILABLE == 'true' && ' Le rapport de couverture de code y est également joint.' || '' }}
+                  </p>
+
+                  <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                     style="display: inline-block; padding: 11px 22px; background: #2563eb; color: #ffffff; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600;">
+                    Voir le run GitHub Actions
+                  </a>
+                </div>
+
+                <div style="background: #f8fafc; padding: 16px 36px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8;">
+                  Généré automatiquement par la pipeline CI/CD
+                </div>
+              </div>
+            </div>
+          attachments: ${{ env.COVERAGE_PDF_AVAILABLE == 'true' && 'backend-report.pdf,frontend-report.pdf,coverage-pdf/coverage-report.pdf' || 'backend-report.pdf,frontend-report.pdf' }}
+
+  push-dockerhub:
+    runs-on: self-hosted
+    needs: trivy-scan
+    # On ne pousse une image et on ne déclenche un redéploiement que pour les
+    # 3 branches d'environnement. Une PR ou une autre branche s'arrête ici.
+    if: github.event_name == 'push' && contains(fromJSON('["main","staging","develop"]'), github.ref_name)
+    steps:
+      - name: Télécharger les images buildées
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Charger les images Docker
+        run: |
+          docker load -i backend-image.tar
+          docker load -i frontend-image.tar
+          docker images
+
+      - name: Connexion à Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tagger les images
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          docker tag backend:test  ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
+          docker tag backend:test  ${{ secrets.DOCKERHUB_USERNAME }}/backend:${SHORT_SHA}
+          docker tag frontend:test ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
+          docker tag frontend:test ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${SHORT_SHA}
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Pousser les images sur Docker Hub
+        run: |
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ env.SHORT_SHA }}
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ env.SHORT_SHA }}
+
+      - name: Résumé
+        run: |
+          echo "### Images poussées sur Docker Hub" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ secrets.DOCKERHUB_USERNAME }}/backend:latest\` et \`:${{ env.SHORT_SHA }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest\` et \`:${{ env.SHORT_SHA }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Met à jour l'OVERLAY kustomize correspondant à la branche (develop -> dev,
+  # staging -> staging, main -> prod) avec le nouveau tag d'image, puis
+  # commit/push ce changement. ArgoCD (Application dédiée à cet environnement,
+  # qui watch ce même repo/branche/path) détecte la modification et resynchronise.
+  update-k8s-manifests:
+    runs-on: self-hosted
+    needs: push-dockerhub
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Installer kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+
+      - name: Déterminer l'overlay cible en fonction de la branche
+        id: env_map
+        run: |
+          case "${{ github.ref_name }}" in
+            develop) echo "overlay=k8s-multi-env/k8s/overlays/dev" >> "$GITHUB_OUTPUT" ;;
+            staging) echo "overlay=k8s-multi-env/k8s/overlays/staging" >> "$GITHUB_OUTPUT" ;;
+            main)    echo "overlay=k8s-multi-env/k8s/overlays/prod" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Branche ${{ github.ref_name }} non mappée à un environnement, arrêt." && exit 1 ;;
+          esac
+
+      - name: Mettre à jour le tag d'image dans l'overlay
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          cd "${{ steps.env_map.outputs.overlay }}"
+          kustomize edit set image \
+            ${{ secrets.DOCKERHUB_USERNAME }}/backend=${{ secrets.DOCKERHUB_USERNAME }}/backend:${SHORT_SHA} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/frontend=${{ secrets.DOCKERHUB_USERNAME }}/frontend:${SHORT_SHA}
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Vérifier s'il y a un changement réel
+        id: git_diff
+        run: |
+          if git diff --quiet -- "${{ steps.env_map.outputs.overlay }}"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # [skip ci] dans le message de commit empêche ce push de redéclencher
+      # le pipeline (sinon boucle infinie : push -> update manifest -> push -> ...)
+      - name: Commit et push des manifests mis à jour
+        if: steps.git_diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.env_map.outputs.overlay }}"
+          git commit -m "Update image version to ${{ env.SHORT_SHA }} (${{ github.ref_name }}) [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Résumé
+        run: |
+          if [ "${{ steps.git_diff.outputs.changed }}" == "true" ]; then
+            echo "### Overlay \`${{ steps.env_map.outputs.overlay }}\` mis à jour vers le tag \`${{ env.SHORT_SHA }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Aucun changement à commiter (tag déjà à jour)" >> "$GITHUB_STEP_SUMMARY"
+          fi
