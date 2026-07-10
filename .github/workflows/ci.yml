@@ -728,6 +728,13 @@ jobs:
   sign-images:
     runs-on: ubuntu-22.04
     needs: push-dockerhub
+    # push-dockerhub peut être "skipped" (PR, ou branche hors main/staging/develop).
+    # Par défaut GitHub Actions exécute quand même ce job dans ce cas (skipped
+    # n'est pas un échec pour la condition implicite success()) : ses outputs
+    # seraient alors vides et cosign planterait ("signing []: could not parse
+    # reference"). On force donc l'exécution uniquement si push-dockerhub a
+    # réellement réussi.
+    if: needs.push-dockerhub.result == 'success'
     # id-token: write est nécessaire pour la signature Cosign "keyless"
     # (OIDC Sigstore) : pas de clé privée à gérer/stocker en secret.
     permissions:
@@ -761,6 +768,9 @@ jobs:
   update-k8s-manifests:
     runs-on: ubuntu-22.04
     needs: sign-images
+    # Même logique que pour sign-images : si sign-images a été sauté (car
+    # push-dockerhub l'a été), on ne veut pas non plus exécuter ce job.
+    if: needs.sign-images.result == 'success'
     permissions:
       contents: write
     steps:
