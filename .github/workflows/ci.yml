@@ -648,8 +648,8 @@ jobs:
     # Digests exposés en sortie de job pour que "sign-images" (job séparé)
     # puisse signer sans avoir à re-pull/re-inspecter les images.
     outputs:
-      backend_digest: ${{ steps.digests.outputs.backend }}
-      frontend_digest: ${{ steps.digests.outputs.frontend }}
+      backend_digest: ${{ steps.push.outputs.backend_digest }}
+      frontend_digest: ${{ steps.push.outputs.frontend_digest }}
     steps:
       - name: Télécharger les images buildées
         uses: actions/download-artifact@v4
@@ -677,23 +677,50 @@ jobs:
           docker tag frontend:test ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${SHORT_SHA}
           echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
 
-      - name: Pousser les images sur Docker Hub
+      - name: Pousser les images sur Docker Hub et capturer leurs digests
+        id: push
         run: |
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ env.SHORT_SHA }}
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ env.SHORT_SHA }}
+          # "docker inspect --format='{{index .RepoDigests 0}}'" s'est révélé
+          # peu fiable juste après un push (dépend du store d'images du
+          # daemon sur les runners GitHub). On extrait donc le digest
+          # directement de la sortie de "docker push", qui l'affiche
+          # toujours explicitement sur sa dernière ligne
+          # (ex: "abc123: digest: sha256:... size: 1234").
+          push_and_get_digest() {
+            local ref="$1"
+            # IMPORTANT : on redirige la sortie de "docker push" vers un
+            # fichier (et on la réaffiche sur stderr pour garder les logs
+            # visibles dans l'étape), SANS jamais laisser cette sortie
+            # transiter par stdout. Cette fonction est appelée dans un
+            # $(...) : si on utilisait "tee" (qui écrit aussi sur stdout),
+            # tout le flux de progression du push ("Preparing", "Pushed",
+            # ...) se retrouverait capturé dans la variable au lieu du seul
+            # digest, ce qui cassait ensuite l'écriture dans $GITHUB_OUTPUT
+            # (format "clé=valeur" invalide sur les lignes suivantes).
+            docker push "$ref" > /tmp/push-output.log 2>&1
+            cat /tmp/push-output.log >&2
+            grep -oE 'sha256:[a-f0-9]{64}' /tmp/push-output.log | tail -1
+          }
 
-      - name: Récupérer les digests des images poussées
-        id: digests
-        run: |
-          # On signera par DIGEST (sha256:...) et non par tag : un tag comme
-          # ":latest" est mutable et peut changer, le digest identifie de
-          # façon unique et immuable le contenu réellement poussé.
-          BACKEND_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ env.SHORT_SHA }})
-          FRONTEND_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ env.SHORT_SHA }})
-          echo "backend=${BACKEND_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "frontend=${FRONTEND_DIGEST}" >> "$GITHUB_OUTPUT"
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
+          BACKEND_HASH=$(push_and_get_digest ${{ secrets.DOCKERHUB_USERNAME }}/backend:${{ env.SHORT_SHA }})
+
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
+          FRONTEND_HASH=$(push_and_get_digest ${{ secrets.DOCKERHUB_USERNAME }}/frontend:${{ env.SHORT_SHA }})
+
+          if [ -z "$BACKEND_HASH" ] || [ -z "$FRONTEND_HASH" ]; then
+            echo "::error::Impossible d'extraire le digest depuis la sortie de docker push."
+            exit 1
+          fi
+
+          # Debug : affiche les digests extraits dans les logs, pour pouvoir
+          # vérifier immédiatement leur format si "sign-images" se met à
+          # échouer avec une reference invalide.
+          echo "Digest backend  : ${{ secrets.DOCKERHUB_USERNAME }}/backend@${BACKEND_HASH}"
+          echo "Digest frontend : ${{ secrets.DOCKERHUB_USERNAME }}/frontend@${FRONTEND_HASH}"
+
+          echo "backend_digest=${{ secrets.DOCKERHUB_USERNAME }}/backend@${BACKEND_HASH}" >> "$GITHUB_OUTPUT"
+          echo "frontend_digest=${{ secrets.DOCKERHUB_USERNAME }}/frontend@${FRONTEND_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Résumé
         run: |
@@ -707,6 +734,17 @@ jobs:
   sign-images:
     runs-on: ubuntu-22.04
     needs: push-dockerhub
+    # push-dockerhub peut être "skipped" (PR, ou branche hors main/staging/develop).
+    # Par défaut GitHub Actions exécute quand même ce job dans ce cas (skipped
+    # n'est pas un échec pour la condition implicite success()) : ses outputs
+    # seraient alors vides et cosign planterait ("signing []: could not parse
+    # reference"). On force donc l'exécution uniquement si push-dockerhub a
+    # réellement réussi ET a bien produit des digests non vides (ceinture et
+    # bretelles, en plus du "exit 1" déjà présent dans push-dockerhub).
+    if: >-
+      needs.push-dockerhub.result == 'success' &&
+      needs.push-dockerhub.outputs.backend_digest != '' &&
+      needs.push-dockerhub.outputs.frontend_digest != ''
     # id-token: write est nécessaire pour la signature Cosign "keyless"
     # (OIDC Sigstore) : pas de clé privée à gérer/stocker en secret.
     permissions:
@@ -740,6 +778,9 @@ jobs:
   update-k8s-manifests:
     runs-on: ubuntu-22.04
     needs: sign-images
+    # Même logique que pour sign-images : si sign-images a été sauté (car
+    # push-dockerhub l'a été), on ne veut pas non plus exécuter ce job.
+    if: needs.sign-images.result == 'success'
     permissions:
       contents: write
     steps:
