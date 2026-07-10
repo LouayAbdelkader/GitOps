@@ -29,7 +29,7 @@ export default function Register() {
           <p className="font-display text-3xl leading-tight max-w-sm">
             Chaque compte est versionné, tracé, et synchronisé avec le cluster.
           </p>
-          <p className="text-white/50 text-sm mt-4 font-mono">GitOps Employee Management Platform Test </p>
+          <p className="text-white/50 text-sm mt-4 font-mono">GitOps Employee Management Platform (Pipline est v1.0) </p>
         </div>
         <p className="text-white/30 text-xs">© {new Date().getFullYear()} — Louay Abdelkader</p>
       </div>
