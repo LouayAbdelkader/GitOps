@@ -26,7 +26,7 @@ export default function Login() {
           <p className="font-display text-3xl leading-tight max-w-sm">
             Un dossier unique pour chaque employé, chaque département, chaque déploiement.
           </p>
-          <p className="text-white/50 text-sm mt-4 font-mono">GitOps Employee Management Platform</p>
+          <p className="text-white/50 text-sm mt-4 font-mono">Test</p>
         </div>
         <p className="text-white/30 text-xs">© {new Date().getFullYear()} — Louay Abdelkader</p>
       </div>
