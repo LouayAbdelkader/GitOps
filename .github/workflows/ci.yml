@@ -87,9 +87,6 @@ jobs:
           path: frontend/coverage
           retention-days: 14
 
-  # Ce job construit les images UNE SEULE FOIS pour tout le pipeline,
-  # puis les exporte en .tar afin que trivy-scan les recharge au lieu
-  # de les reconstruire (évite un double build backend + frontend).
   build-docker-images:
     runs-on: ubuntu-22.04
     needs: [lint-backend, lint-frontend]
@@ -99,11 +96,6 @@ jobs:
       - name: Configurer Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build backend avec cache BuildKit (GitHub Actions cache backend).
-      # "load: true" charge l'image dans le daemon Docker local (comme un
-      # "docker build" classique) sans la pousser sur un registre ici.
-      # Le cache est scoppé par image pour ne pas mélanger les layers
-      # backend/frontend.
       - name: Build image backend (avec cache)
         uses: docker/build-push-action@v6
         with:
@@ -271,11 +263,6 @@ jobs:
       - name: Installer wkhtmltopdf
         if: always()
         run: |
-          # "apt-get install wkhtmltopdf" tire tout Qt5 WebKit + X11 (avahi,
-          # ModemManager, geoclue...) : 35 Mo, très lent, et certains paquets
-          # déclenchent des prompts interactifs qui bloquent le runner.
-          # On installe à la place le binaire statique officiel (headless,
-          # sans dépendances GUI).
           curl -sLo wkhtmltox.deb "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
           sudo apt-get install -y ./wkhtmltox.deb
           rm -f wkhtmltox.deb
@@ -642,11 +629,7 @@ jobs:
   push-dockerhub:
     runs-on: ubuntu-22.04
     needs: trivy-scan
-    # On ne pousse une image et on ne déclenche un redéploiement que pour les
-    # 3 branches d'environnement. Une PR ou une autre branche s'arrête ici.
     if: github.event_name == 'push' && contains(fromJSON('["main","staging","develop"]'), github.ref_name)
-    # Digests exposés en sortie de job pour que "sign-images" (job séparé)
-    # puisse signer sans avoir à re-pull/re-inspecter les images.
     outputs:
       backend_digest: ${{ steps.push.outputs.backend_digest }}
       frontend_digest: ${{ steps.push.outputs.frontend_digest }}
@@ -680,23 +663,8 @@ jobs:
       - name: Pousser les images sur Docker Hub et capturer leurs digests
         id: push
         run: |
-          # "docker inspect --format='{{index .RepoDigests 0}}'" s'est révélé
-          # peu fiable juste après un push (dépend du store d'images du
-          # daemon sur les runners GitHub). On extrait donc le digest
-          # directement de la sortie de "docker push", qui l'affiche
-          # toujours explicitement sur sa dernière ligne
-          # (ex: "abc123: digest: sha256:... size: 1234").
           push_and_get_digest() {
             local ref="$1"
-            # IMPORTANT : on redirige la sortie de "docker push" vers un
-            # fichier (et on la réaffiche sur stderr pour garder les logs
-            # visibles dans l'étape), SANS jamais laisser cette sortie
-            # transiter par stdout. Cette fonction est appelée dans un
-            # $(...) : si on utilisait "tee" (qui écrit aussi sur stdout),
-            # tout le flux de progression du push ("Preparing", "Pushed",
-            # ...) se retrouverait capturé dans la variable au lieu du seul
-            # digest, ce qui cassait ensuite l'écriture dans $GITHUB_OUTPUT
-            # (format "clé=valeur" invalide sur les lignes suivantes).
             docker push "$ref" > /tmp/push-output.log 2>&1
             cat /tmp/push-output.log >&2
             grep -oE 'sha256:[a-f0-9]{64}' /tmp/push-output.log | tail -1
@@ -722,21 +690,13 @@ jobs:
           echo "- \`${{ secrets.DOCKERHUB_USERNAME }}/backend:latest\` et \`:${{ env.SHORT_SHA }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest\` et \`:${{ env.SHORT_SHA }}\`" >> "$GITHUB_STEP_SUMMARY"
 
-  # Job séparé et dédié à la signature Cosign : plus facile à relire/débugger
-  # indépendamment du push Docker Hub. Ne récupère aucune image (pas besoin),
-  # il signe directement les digests distants exposés par push-dockerhub.
   sign-images:
     runs-on: ubuntu-22.04
     needs: push-dockerhub
-    # push-dockerhub peut être "skipped" (PR, ou branche hors main/staging/develop).
-    # Par défaut GitHub Actions exécute quand même ce job dans ce cas (skipped
-    # n'est pas un échec pour la condition implicite success()) : ses outputs
-    # seraient alors vides et cosign planterait ("signing []: could not parse
-    # reference"). On force donc l'exécution uniquement si push-dockerhub a
-    # réellement réussi.
-    if: needs.push-dockerhub.result == 'success'
-    # id-token: write est nécessaire pour la signature Cosign "keyless"
-    # (OIDC Sigstore) : pas de clé privée à gérer/stocker en secret.
+    if: |
+      needs.push-dockerhub.result == 'success' &&
+      needs.push-dockerhub.outputs.backend_digest != '' &&
+      needs.push-dockerhub.outputs.frontend_digest != ''
     permissions:
       contents: read
       id-token: write
@@ -761,15 +721,9 @@ jobs:
           echo "- \`${{ needs.push-dockerhub.outputs.backend_digest }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`${{ needs.push-dockerhub.outputs.frontend_digest }}\`" >> "$GITHUB_STEP_SUMMARY"
 
-  # Met à jour l'OVERLAY kustomize correspondant à la branche (develop -> dev,
-  # staging -> staging, main -> prod) avec le nouveau tag d'image, puis
-  # commit/push ce changement. ArgoCD (Application dédiée à cet environnement,
-  # qui watch ce même repo/branche/path) détecte la modification et resynchronise.
   update-k8s-manifests:
     runs-on: ubuntu-22.04
     needs: sign-images
-    # Même logique que pour sign-images : si sign-images a été sauté (car
-    # push-dockerhub l'a été), on ne veut pas non plus exécuter ce job.
     if: needs.sign-images.result == 'success'
     permissions:
       contents: write
@@ -781,10 +735,6 @@ jobs:
 
       - name: Installer kustomize
         run: |
-          # L'ancien script officiel install_kustomize.sh interroge l'API GitHub
-          # pour trouver la dernière release et échoue silencieusement en cas de
-          # rate-limit / changement de format de réponse (tar.gz introuvable).
-          # On télécharge ici une version précise et épinglée, en direct.
           KUSTOMIZE_VERSION="5.4.3"
           curl -sLo kustomize.tar.gz \
             "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
@@ -821,8 +771,6 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # [skip ci] dans le message de commit empêche ce push de redéclencher
-      # le pipeline (sinon boucle infinie : push -> update manifest -> push -> ...)
       - name: Commit et push des manifests mis à jour
         if: steps.git_diff.outputs.changed == 'true'
         run: |
@@ -840,10 +788,6 @@ jobs:
             echo "### Aucun changement à commiter (tag déjà à jour)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  # Email récapitulatif final : liste chaque étape du pipeline avec son
-  # statut (succès / échec / ignorée). Tourne TOUJOURS (if: always()),
-  # même si une ou plusieurs étapes précédentes ont échoué, pour qu'on
-  # sache exactement où ça a cassé.
   notify-pipeline-summary:
     runs-on: ubuntu-22.04
     if: always()
@@ -860,8 +804,6 @@ jobs:
       - name: Déterminer le statut global
         id: global
         run: |
-          # Si un des jobs requis a échoué -> statut global ÉCHEC.
-          # "skipped" (ex: push-dockerhub sur une PR) n'est pas un échec.
           if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
             echo "status=failure" >> "$GITHUB_OUTPUT"
           else
@@ -885,9 +827,6 @@ jobs:
       - name: Lister les rapports disponibles pour l'email
         id: attachments
         run: |
-          # Construit la liste des pièces jointes réellement présentes
-          # (certaines peuvent manquer si le job correspondant a échoué
-          # avant de générer son PDF).
           FILES=""
           for f in reports/coverage-report.pdf reports/backend-report.pdf reports/frontend-report.pdf; do
             if [ -f "$f" ]; then
@@ -900,8 +839,6 @@ jobs:
       - name: Construire le tableau des étapes
         id: steps_table
         run: |
-          # Génère une ligne de tableau HTML par étape, avec pastille de
-          # couleur selon le résultat (success / failure / skipped / cancelled).
           row() {
             local label="$1" result="$2"
             local color bg text
