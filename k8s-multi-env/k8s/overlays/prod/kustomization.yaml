@@ -11,10 +11,10 @@ resources:
 images:
 - name: silou19/backend
   newName: silou19/backend
-  newTag: ab8e2a7
+  newTag: 434af56
 - name: silou19/frontend
   newName: silou19/frontend
-  newTag: ab8e2a7
+  newTag: 434af56
 
 patches:
 - path: patch-replicas.yaml
