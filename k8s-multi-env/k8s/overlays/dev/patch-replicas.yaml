@@ -6,7 +6,7 @@ spec:
   replicas: 1
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: Rollout
 metadata:
   name: frontend-deployment
 spec:
